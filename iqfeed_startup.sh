@@ -1,28 +1,51 @@
 #!/bin/bash
-set -e
 
-echo "=== IQFeed Startup Script ==="
+export WINEARCH=win64
+export WINEPREFIX=/root/.wine64
+export DISPLAY=:0
+export WINEDEBUG=-all
 
-# Check if IQFeed client is installed
-iqconnect_patched="/root/.wine/drive_c/Program Files/DTN/IQFeed/iqconnect_patched.exe"
-iqconnect_orig="/root/.wine/drive_c/Program Files/DTN/IQFeed/iqconnect.exe"
+INSTALLER="/root/${IQFEED_INSTALLER:-iqfeed_client_6_2_0_25.exe}"
 
-if [ -f "$iqconnect_patched" ] || [ -f "$iqconnect_orig" ]; then
-    echo "✓ IQFeed client is installed"
-    
-    # Wait a bit for X11 to be ready
-    sleep 2
-    
-    # Launch using Python script with credentials from environment
-    echo "Launching IQFeed client..."
-    exec python3 /root/launch_iqfeed.py
+# Check multiple possible install locations
+iqconnect_exe=""
+for path in \
+  "/root/.wine64/drive_c/Program Files/DTN/IQFeed/iqconnect.exe" \
+  "/root/.wine64/drive_c/Program Files (x86)/DTN/IQFeed/iqconnect.exe" \
+  "/root/.wine/drive_c/Program Files/DTN/IQFeed/iqconnect.exe" \
+  "/root/.wine/drive_c/Program Files (x86)/DTN/IQFeed/iqconnect.exe"; do
+  if [ -f "$path" ]; then
+    iqconnect_exe="$path"
+    break
+  fi
+done
+
+if [ -n "$iqconnect_exe" ]; then
+  echo "IQFeed found at: $iqconnect_exe"
+  echo "Launching IQFeed client with autoconnect..."
+
+  # Run iqconnect in a loop - if it crashes, restart it immediately
+  while true; do
+    echo "[$(date)] Starting iqconnect.exe..."
+    wine64 "$iqconnect_exe" \
+      -autoconnect \
+      -product "${PRODUCT_ID:-IQFEED_DEMO}" \
+      -version 6.2.0.25 \
+      -login "${LOGIN:-523028}" \
+      -password "${PASSWORD:-}" 2>&1
+
+    EXIT_CODE=$?
+    echo "[$(date)] iqconnect.exe exited with code $EXIT_CODE. Restarting in 3 seconds..."
+    sleep 3
+  done
 else
-    echo "✗ ERROR: IQFeed client not found!"
-    echo "Expected locations:"
-    echo "  - $iqconnect_patched"
-    echo "  - $iqconnect_orig"
-    echo ""
-    echo "The Docker build should have installed IQFeed."
-    echo "Please rebuild the image."
-    exit 1
+  echo "IQFeed not installed. Running installer: $INSTALLER"
+  # Initialize Wine prefix first
+  wineboot --init 2>&1 | head -n 5 || true
+  sleep 3
+  # Run installer
+  wine64 "$INSTALLER" 2>&1
+  echo "Installer finished. Restarting startup script..."
+  # After installation, re-run this script to find and launch iqconnect
+  exec "$0"
 fi
