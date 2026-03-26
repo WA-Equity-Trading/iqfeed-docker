@@ -10,6 +10,7 @@ OUTPUT_PATH="${3:?Usage: $0 <start_date> <end_date> <output_path>}"
 IMAGE="us-central1-docker.pkg.dev/wa-equity-trading/iqfeed/iqfeed-client:latest"
 FAIL_COUNT=0
 PARALLELISM=32
+MAX_ATTEMPTS=5
 
 start_container() {
   echo "=== Stopping old container ==="
@@ -115,14 +116,19 @@ run_download() {
   return 0
 }
 
-# Main loop
+# Main loop with max attempts
 ATTEMPT=0
 while true; do
   ATTEMPT=$((ATTEMPT + 1))
   echo ""
   echo "========================================="
-  echo "=== ATTEMPT $ATTEMPT ==="
+  echo "=== ATTEMPT $ATTEMPT / $MAX_ATTEMPTS ==="
   echo "========================================="
+
+  if [ $ATTEMPT -gt $MAX_ATTEMPTS ]; then
+    echo "=== FAILED: Max attempts ($MAX_ATTEMPTS) exceeded ==="
+    exit 1
+  fi
 
   start_container
   wait_for_iqfeed || continue

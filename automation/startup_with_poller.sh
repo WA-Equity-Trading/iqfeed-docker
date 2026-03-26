@@ -82,7 +82,7 @@ fi
 # Start the queue downloader (checks BQ for DOWNLOAD batches every hour)
 if [ -f "${HOME}/vm_queue_downloads.sh" ]; then
   echo "Starting queue downloader..."
-  nohup bash -c "while true; do bash ${HOME}/vm_queue_downloads.sh >> ${HOME}/queue_downloads.log 2>&1; sleep 3600; done" > /dev/null 2>&1 &
+  nohup bash -c "while true; do bash ${HOME}/vm_queue_downloads.sh >> ${HOME}/queue_downloads.log 2>&1; sleep 3600; done" >> "${HOME}/queue_downloader_wrapper.log" 2>&1 &
   echo "Queue downloader started (PID $!)."
 else
   echo "Warning: vm_queue_downloads.sh not found. Queue downloader not started."

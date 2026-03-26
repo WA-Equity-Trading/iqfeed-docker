@@ -20,6 +20,7 @@ echo "=== Uploading scripts to gs://${BUCKET}/${SCRIPTS_PREFIX}/ ==="
 
 gsutil cp "${REPO_DIR}/vm_batch_ingest.sh"       "gs://${BUCKET}/${SCRIPTS_PREFIX}/vm_batch_ingest.sh"
 gsutil cp "${SCRIPT_DIR}/vm_job_poller.sh"        "gs://${BUCKET}/${SCRIPTS_PREFIX}/vm_job_poller.sh"
+gsutil cp "${SCRIPT_DIR}/vm_queue_downloads.sh"   "gs://${BUCKET}/${SCRIPTS_PREFIX}/vm_queue_downloads.sh"
 gsutil cp "${REPO_DIR}/symbols.txt"               "gs://${BUCKET}/${SCRIPTS_PREFIX}/symbols.txt"
 
 echo "=== Scripts uploaded. ==="
