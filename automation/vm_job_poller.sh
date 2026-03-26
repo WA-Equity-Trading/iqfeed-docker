@@ -7,11 +7,12 @@
 # Uses curl + GCS JSON API + instance metadata token (no gsutil needed on COS).
 #
 # GCS job queue layout:
-#   jobs/pending/<job_id>.json    ← written by Apps Script
+#   jobs/pending/<job_id>.json    ← written by vm_queue_downloads.sh
 #   jobs/running/<job_id>.json    ← moved here while ingesting
 #   jobs/completed/<job_id>.json  ← moved here after _SUCCESS
 
-set -euo pipefail
+# Only apply strict mode to function definitions, NOT the main loop.
+# The main loop uses explicit error handling to stay resilient.
 
 BUCKET="bkt-prd-iqfeed-raw-files-001"
 PENDING_PREFIX="jobs/pending/"
@@ -64,11 +65,17 @@ gcs_delete() {
     -H "Authorization: Bearer ${token}" > /dev/null 2>&1 || true
 }
 
+# gcs_move — copy-then-delete with verification.
+# Returns non-zero if the read or upload fails (delete is best-effort).
 gcs_move() {
   local token="$1" from="$2" to="$3"
   local content
-  content=$(gcs_read "$token" "$from")
-  gcs_upload "$token" "$to" "$content"
+  content=$(gcs_read "$token" "$from") || { log "ERROR: gcs_move failed to read $from"; return 1; }
+  if [ -z "$content" ]; then
+    log "ERROR: gcs_move read empty content from $from"
+    return 1
+  fi
+  gcs_upload "$token" "$to" "$content" || { log "ERROR: gcs_move failed to upload to $to"; return 1; }
   gcs_delete "$token" "$from"
 }
 
@@ -80,24 +87,33 @@ urlencode() {
 # ── Market hours check ───────────────────────────────────────────────────────
 
 is_market_hours() {
-  local utc_hour utc_min dow month offset et_hour time_min
+  local utc_hour utc_min dow
   utc_hour=$(date -u +%H | sed 's/^0*//' ); utc_hour=${utc_hour:-0}
   utc_min=$(date -u +%M | sed 's/^0*//' );  utc_min=${utc_min:-0}
   dow=$(date -u +%u)   # 1=Mon … 7=Sun
-  month=$(date -u +%m | sed 's/^0*//' ); month=${month:-1}
 
   # Weekend → not market hours
   [ "$dow" -ge 6 ] && return 1
 
-  # EDT (UTC-4) March–November, EST (UTC-5) otherwise
-  offset=5
-  [ "$month" -ge 3 ] && [ "$month" -le 11 ] && offset=4
-
-  et_hour=$(( (utc_hour - offset + 24) % 24 ))
-  time_min=$(( et_hour * 60 + utc_min ))
+  # Use python3 for correct DST handling
+  local et_minutes
+  et_minutes=$(python3 -c "
+from datetime import datetime, timezone
+import zoneinfo
+now = datetime.now(zoneinfo.ZoneInfo('America/New_York'))
+print(now.hour * 60 + now.minute)
+" 2>/dev/null) || {
+    # Fallback: simple month-based offset (March–November = EDT)
+    local month offset et_hour
+    month=$(date -u +%m | sed 's/^0*//' ); month=${month:-1}
+    offset=5
+    [ "$month" -ge 3 ] && [ "$month" -le 11 ] && offset=4
+    et_hour=$(( (utc_hour - offset + 24) % 24 ))
+    et_minutes=$(( et_hour * 60 + utc_min ))
+  }
 
   # Market hours: 9:30 (570) – 16:00 (960) ET
-  [ "$time_min" -ge 570 ] && [ "$time_min" -lt 960 ] && return 0
+  [ "$et_minutes" -ge 570 ] && [ "$et_minutes" -lt 960 ] && return 0
   return 1
 }
 
@@ -105,8 +121,8 @@ is_market_hours() {
 
 # Prevent multiple instances
 if [ -f "$LOCK_FILE" ]; then
-  OTHER_PID=$(cat "$LOCK_FILE" 2>/dev/null)
-  if kill -0 "$OTHER_PID" 2>/dev/null; then
+  OTHER_PID=$(cat "$LOCK_FILE" 2>/dev/null || true)
+  if [ -n "$OTHER_PID" ] && kill -0 "$OTHER_PID" 2>/dev/null; then
     log "Another instance running (PID $OTHER_PID). Exiting."
     exit 0
   fi
@@ -124,14 +140,19 @@ while true; do
     continue
   fi
 
-  TOKEN=$(get_token)
+  # ── Token ──
+  TOKEN=$(get_token 2>/dev/null || true)
   if [ -z "$TOKEN" ]; then
     log "Failed to get metadata token. Retrying..."
     continue
   fi
 
-  # List pending jobs
-  RESPONSE=$(gcs_list "$TOKEN" "$PENDING_PREFIX")
+  # ── List pending jobs ──
+  RESPONSE=$(gcs_list "$TOKEN" "$PENDING_PREFIX" 2>/dev/null || true)
+  if [ -z "$RESPONSE" ]; then
+    continue
+  fi
+
   JOB_FILES=$(echo "$RESPONSE" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
@@ -149,29 +170,55 @@ for item in data.get('items', []):
 
   log "Found pending job: $JOB_ID"
 
-  # Read job details
-  JOB_JSON=$(gcs_read "$TOKEN" "$JOB_FILE")
-  START_DATE=$(echo "$JOB_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['start_date'])")
-  END_DATE=$(echo "$JOB_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['end_date'])")
-  OUTPUT_PATH=$(echo "$JOB_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['output_path'])")
+  # ── Read and parse job JSON ──
+  JOB_JSON=$(gcs_read "$TOKEN" "$JOB_FILE" 2>/dev/null || true)
+  if [ -z "$JOB_JSON" ]; then
+    log "ERROR: Failed to read job file $JOB_FILE. Skipping."
+    continue
+  fi
+
+  START_DATE=$(echo "$JOB_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['start_date'])" 2>/dev/null) || {
+    log "ERROR: Failed to parse job JSON for $JOB_ID. Skipping."
+    continue
+  }
+  END_DATE=$(echo "$JOB_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['end_date'])" 2>/dev/null) || {
+    log "ERROR: Failed to parse end_date for $JOB_ID. Skipping."
+    continue
+  }
+  OUTPUT_PATH=$(echo "$JOB_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['output_path'])" 2>/dev/null) || {
+    log "ERROR: Failed to parse output_path for $JOB_ID. Skipping."
+    continue
+  }
 
   log "Job $JOB_ID: start=$START_DATE end=$END_DATE output=$OUTPUT_PATH"
 
-  # Move to running
-  gcs_move "$TOKEN" "$JOB_FILE" "${RUNNING_PREFIX}${JOB_ID}.json"
+  # ── Move to running ──
+  if ! gcs_move "$TOKEN" "$JOB_FILE" "${RUNNING_PREFIX}${JOB_ID}.json"; then
+    log "ERROR: Failed to move $JOB_ID to running. Skipping."
+    continue
+  fi
   log "Moved $JOB_ID to running."
 
-  # Execute vm_batch_ingest.sh (blocking — one job at a time)
+  # ── Execute vm_batch_ingest.sh (blocking — one job at a time) ──
   log "Starting vm_batch_ingest.sh for $JOB_ID..."
   if bash ~/vm_batch_ingest.sh "$START_DATE" "$END_DATE" "$OUTPUT_PATH" >> ~/ingest_${JOB_ID}.log 2>&1; then
     log "Job $JOB_ID completed successfully."
     # Refresh token (ingestion can take hours)
-    TOKEN=$(get_token)
-    gcs_move "$TOKEN" "${RUNNING_PREFIX}${JOB_ID}.json" "${COMPLETED_PREFIX}${JOB_ID}.json"
+    TOKEN=$(get_token 2>/dev/null || true)
+    if [ -z "$TOKEN" ]; then
+      log "WARNING: Token refresh failed after job $JOB_ID. Will retry move on next cycle."
+      continue
+    fi
+    if ! gcs_move "$TOKEN" "${RUNNING_PREFIX}${JOB_ID}.json" "${COMPLETED_PREFIX}${JOB_ID}.json"; then
+      log "WARNING: Job $JOB_ID succeeded but failed to move to completed/. Will retry."
+    fi
   else
-    log "Job $JOB_ID failed. Leaving in running/ for manual review."
-    # Move back to pending for retry? Or leave in running for investigation.
-    # Leaving in running — operator can move back to pending/ to retry.
+    log "Job $JOB_ID FAILED (exit code $?). Moving back to pending/ for retry."
+    TOKEN=$(get_token 2>/dev/null || true)
+    if [ -n "$TOKEN" ]; then
+      gcs_move "$TOKEN" "${RUNNING_PREFIX}${JOB_ID}.json" "${PENDING_PREFIX}${JOB_ID}.json" || \
+        log "WARNING: Could not move failed job $JOB_ID back to pending/."
+    fi
   fi
 
 done
